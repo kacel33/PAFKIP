@@ -1,0 +1,39 @@
+PAF-KIP TTA Operators & Dominant Arithmetic
+============================================
+
+[PAF (Prediction Aggregation Filtering)]
+Operator                     | Dominant Arithmetic
+-----------------------------|--------------------------------------------
+Softmax                      | exp, sub (max), div, reduction
+Shannon Entropy              | mul + log + reduction (-Σp log p)
+Log (threshold)              | log
+Element-wise 비교            | compare (<)
+Bitwise Select (where)       | conditional select
+Boolean AND                  | bitwise AND
+Boolean Indexing             | gather
+
+[KIP (Knowledge-Informed Prediction)]
+Operator                     | Dominant Arithmetic
+-----------------------------|--------------------------------------------
+Softmax                      | exp, sub, div, reduction
+Max (Confidence)             | compare + conditional update
+Mean                         | add + div
+Delta 계산                   | sub
+Weight 계산                  | scalar mul + add
+Weighted Sum                 | mul + add
+
+[Loss & Optimization]
+Operator                     | Dominant Arithmetic
+-----------------------------|--------------------------------------------
+Softmax Entropy              | softmax + log_softmax + mul + reduction
+Entropy Coefficient          | sub + exp + div (1/exp(ent-thr))
+Loss Combine                 | scalar mul + sub
+Backward (BN γ, β)           | chain rule: mul + add + reduction
+SGD Step                     | FMA (θ ← θ - lr·grad)
+
+[EMA & Forward]
+Operator                     | Dominant Arithmetic
+-----------------------------|--------------------------------------------
+Forward                      | MAC (conv, linear, BN)
+EMA Update                   | FMA (α·θ_ema + (1-α)·θ)
+LogSumExp                    | exp + reduction + log
