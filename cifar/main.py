@@ -17,7 +17,7 @@ from robustbench.model_zoo.enums import ThreatModel
 from robustbench.utils import load_model
 
 from methods import cotta, eata, ostta, tent, sotta, stamp, rotta, ours
-from data import load_svhn_c, load_tiny_imagenet_c, load_textures_c, load_places365_c
+from data import load_svhn_c, load_tiny_imagenet_c, load_textures_c, load_places365_c, load_gaussian, load_uniform
 from utils import AverageMeter, set_random_seed
 from sam import SAM
 from robustbench.data import load_cifar10c, load_cifar100c
@@ -111,8 +111,7 @@ def evaluate(args):
         model = tent.Tent(base_model, optimizer, steps=args.steps, episodic=args.episodic, alpha=alpha, criterion=args.criterion)
         
     elif args.adaptation == "eata":
-        if args.dataset == 'cifar10':
-            fisher_dataset = eval("datasets." + f"{args.dataset}".upper())(args.data_dir, transform=transforms.ToTensor(), download=True)
+        fisher_dataset = eval("datasets." + f"{args.dataset}".upper())(args.data_dir, transform=transforms.ToTensor(), download=True)
         sampled_indices = torch.randperm(len(fisher_dataset))[:args.fisher_size]
         sampler = SubsetRandomSampler(sampled_indices)
         fisher_loader = DataLoader(fisher_dataset, batch_size=args.batch_size, sampler=sampler)
@@ -209,11 +208,14 @@ def evaluate(args):
                 else:
                     x_ind, y_ind = eval(f"load_{args.dataset}c")(int(args.num_ex * (1 / args.open_set_ratio)), severity, args.data_dir, False, [corruption_type])
                     num_ood_ex = args.num_ex
-                if args.ood_dataset == 'svhn': x_ood, _ = load_svhn_c(num_ood_ex, severity, args.data_dir, False, [corruption_type])
-                elif args.ood_dataset == 'tiny_imagenet': x_ood, _ = load_tiny_imagenet_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
-                elif args.ood_dataset == 'places365': x_ood, _ = load_places365_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
-                elif args.ood_dataset == 'textures': x_ood, _ = load_textures_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
+
                 if args.open_set_tta == "True":
+                    if args.ood_dataset == 'svhn': x_ood, _ = load_svhn_c(num_ood_ex, severity, args.data_dir, False, [corruption_type])
+                    elif args.ood_dataset == 'tiny_imagenet': x_ood, _ = load_tiny_imagenet_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
+                    elif args.ood_dataset == 'places365': x_ood, _ = load_places365_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
+                    elif args.ood_dataset == 'textures': x_ood, _ = load_textures_c(num_ood_ex, severity, args.data_dir, True, [corruption_type])
+                    elif args.ood_dataset == 'gaussian': x_ood, _ = load_gaussian(num_ood_ex)
+                    elif args.ood_dataset == 'uniform': x_ood, _ = load_uniform(num_ood_ex)
                     x_ind, y_ind, x_ood = x_ind.cuda(), y_ind.cuda(), x_ood.cuda()
                     y_ood = torch.ones(num_ood_ex).long().cuda() * -1
                     ind_dataset = TensorDataset(x_ind, y_ind)

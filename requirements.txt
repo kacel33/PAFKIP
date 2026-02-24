@@ -1,0 +1,11 @@
+torch
+torchvision
+robustbench
+prettytable
+tqdm
+iopath
+scikit-learn
+scipy
+termcolor
+wandb
+autoattack @ git+https://github.com/fra31/auto-attack
