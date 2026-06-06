@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+cifar/logs/
+cifar/output/
+*.swp
+.DS_Store
