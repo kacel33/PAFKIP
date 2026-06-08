@@ -1,9 +1,24 @@
 import argparse
 import math
 import os
+import sys
+# Make repo-root `quantization/` importable
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
+# Robustbench checkpoints contain numpy scalars; PyTorch 2.6+ rejects them
+# under the new weights_only=True default. Allow-list and fall back if needed.
+try:
+    torch.serialization.add_safe_globals([np.core.multiarray.scalar, np.dtype, np.ndarray])
+except Exception:
+    pass
+_orig_torch_load = torch.load
+def _torch_load_allow(*a, **kw):
+    kw.setdefault("weights_only", False)
+    return _orig_torch_load(*a, **kw)
+torch.load = _torch_load_allow
+
 import torch.nn as nn
 import torch.optim as optim
 import torchvision.datasets as datasets
@@ -71,6 +86,29 @@ parser.add_argument("--mt", default=0.999, type=float)
 parser.add_argument("--thr", default=0.4, type=float)
 parser.add_argument("--ours_alpha", default=2.0, type=float)
 
+# OOD source for open-set TTA
+parser.add_argument("--ood_dataset", default="imagenet_o_c",
+                    choices=["imagenet_o_c", "gaussian", "uniform"])
+
+# MX (Microscaling) fake-quant
+parser.add_argument("--mx_quantize", action="store_true")
+parser.add_argument("--mx_format", default="int4", choices=["fp4", "int4"])
+parser.add_argument("--mx_group_size", default=32, type=int)
+parser.add_argument("--mx_no_e8m0", action="store_true")
+parser.add_argument("--mx_no_act", action="store_true")
+parser.add_argument("--mx_no_skip_first", action="store_true")
+
+# Global (per-tensor act + per-channel weight) PTQ
+parser.add_argument("--quantize", action="store_true",
+                    help="Enable global INT4 PTQ (per-tensor act, per-channel weight).")
+parser.add_argument("--w_bits", default=4, type=int)
+parser.add_argument("--a_bits", default=4, type=int)
+parser.add_argument("--act_percentile", default=0.999, type=float)
+parser.add_argument("--mse_weight", action="store_true", default=True)
+parser.add_argument("--skip_first_conv", action="store_true", default=True)
+parser.add_argument("--act_granularity", default="per_tensor",
+                    choices=["per_tensor", "per_channel", "per_sample"])
+
 args = parser.parse_args()
 
 args.type = ["gaussian_noise", "shot_noise", "impulse_noise",
@@ -89,9 +127,49 @@ logger = get_logger(__name__, args.save_dir, args.log_dest)
 logger.info(f"args:\n{args}")
 
 
+def _load_ood(num_ex, severity, data_dir, corruption_type, dev):
+    """Return [N, 3, 224, 224] OOD tensor on device per --ood_dataset selection."""
+    if args.ood_dataset == "imagenet_o_c":
+        x, _ = load_imagenet_o_c(num_ex, severity, data_dir, True, [corruption_type])
+        return x.to(dev)
+    # Synthetic OOD: noise images, ImageNet-normalized in [0,1] then standard mean/std.
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    if args.ood_dataset == "gaussian":
+        x = torch.randn(num_ex, 3, 224, 224).clamp(-2, 2)
+        x = (x * 0.25 + 0.5).clamp(0, 1)
+    else:  # uniform
+        x = torch.rand(num_ex, 3, 224, 224)
+    x = (x - mean) / std
+    return x.to(dev)
+
+
 def evaluate(hyperparameters=None):
     # configure model
     base_model = load_model(args.arch, args.ckpt_dir, args.dataset, "corruptions").cuda()
+
+    if args.mx_quantize:
+        from quantization import apply_mx_quantization
+        base_model = apply_mx_quantization(
+            base_model,
+            fp4=(args.mx_format == "fp4"),
+            group_size=args.mx_group_size,
+            use_e8m0=(not args.mx_no_e8m0),
+            quant_act=(not args.mx_no_act),
+            skip_first=(not args.mx_no_skip_first),
+        )
+
+    if args.quantize:
+        from quantization import apply_quantization
+        base_model = apply_quantization(
+            base_model,
+            w_bits=args.w_bits, a_bits=args.a_bits,
+            act_percentile=args.act_percentile,
+            mse_weight=args.mse_weight,
+            skip_first=args.skip_first_conv,
+            act_granularity=args.act_granularity,
+        )
+
     if args.adaptation == "source":
         base_model.eval()
         model = base_model
@@ -169,8 +247,8 @@ def evaluate(hyperparameters=None):
                 # continual adaptation for all corruption
                 logger.info("not resetting model")
                 x_ind, y_ind = load_imagenetc(args.num_ex, severity, args.data_dir, True, [corruption_type])
-                x_ood, _ = load_imagenet_o_c(args.num_ex, severity, args.data_dir, True, [corruption_type])
-                x_ind, y_ind, x_ood = x_ind.to(device), y_ind.to(device), x_ood.to(device)  
+                x_ind, y_ind = x_ind.to(device), y_ind.to(device)
+                x_ood = _load_ood(args.num_ex, severity, args.data_dir, corruption_type, device)
 
                 acc, (auc, fpr), oscr_ = get_results(model, x_ind, y_ind, x_ood, args.batch_size, device)
                 err = 1. - acc

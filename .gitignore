@@ -3,5 +3,8 @@ __pycache__/
 *.pyo
 cifar/logs/
 cifar/output/
+imagenet/logs/
+imagenet/output/
+imagenet/ckpt/
 *.swp
 .DS_Store
