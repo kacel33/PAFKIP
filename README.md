@@ -356,7 +356,129 @@ python main.py --adaptation stamp --dataset cifar10 --ood_dataset tiny_imagenet
 
 ---
 
-## 7. Troubleshooting
+## 7. Quantization (MX-FP4 / MX-INT4 + W4A4 PTQ stack)
+
+A self-contained quantization toolkit lives in [`quantization/`](quantization/).
+Two layers, both wired through `cifar/main.py` flags:
+
+- **`quantization.mx`** — OCP **Microscaling** fake-quant (MX-FP4 E2M1 / MX-INT4),
+  group-shared E8M0 power-of-2 scale along the convolution contraction vector
+  (`C_in * k_h * k_w` via `F.unfold`). Each `MXQuantConv2d` exposes
+  `weight_fake_quant` and `act_fake_quant` as named `nn.Module`s, so
+  `torch.fx.symbolic_trace` produces a graph with explicit quantize/dequantize
+  `call_module` nodes — matching the torch.ao `prepare_fx` pattern (lowerable
+  to a real MX-INT4 / MX-FP4 NPU backend).
+- **`quantization.ptq`** — hand-rolled W4A4 stack: AdaRound, BRECQ, QDrop,
+  NIPQ (learnable scale + mixed-precision bit allocation), SmoothQuant.
+
+### 7.1 Quick start — MX (Microscaling)
+
+`BF16` baseline = **78.37 %** mean ACC on CIFAR-10-C / PAF-KIP / gaussian OOD.
+Within 2 % is the deployable target; commands below are exactly the configs we measured.
+
+```bash
+cd cifar
+
+# Best deployable: MX-INT4 with group size 16 (skip first conv; HW standard)
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --mx_quantize --mx_format int4 --mx_group_size 16
+
+# OCP-spec group size (32)
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --mx_quantize --mx_format int4 --mx_group_size 32
+
+# MX-FP4 (E2M1) variant
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --mx_quantize --mx_format fp4 --mx_group_size 32
+
+# Strict HW-faithful: quantize the first Conv2d too (no exceptions)
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --mx_quantize --mx_format int4 --mx_group_size 32 --mx_no_skip_first
+```
+
+Measured numbers (`--rng_seed 1`, batch_size 200, 15 corruptions, severity 5):
+
+| Config | Mean ACC | Δ vs BF16 | AUROC | Within 2 %? |
+|---|---|---|---|---|
+| **MX-INT4 g=16** | **77.73** | **−0.64** | 99.75 | ✅ |
+| MX-INT4 g=32 | 77.50 | −0.87 | 99.75 | ✅ |
+| MX-FP4 g=16 | 76.77 | −1.60 | 99.73 | ✅ |
+| MX-FP4 g=32 | 76.80 | −1.57 | 99.76 | ✅ |
+| MX-INT4 g=32, no-skip-first (strict HW) | 76.72 | −1.65 | 99.75 | ✅ |
+| MX-FP4 g=32, no-skip-first (strict HW)  | 75.33 | −3.04 | 99.69 | ⚠️ |
+
+Observations:
+- **AUROC stays essentially identical** to BF16 (≤0.05 pp loss) — OOD detection is not affected.
+- **MX-INT4 outperforms MX-FP4** by ~1 pp on this CNN/TTA setup: E2M1's level grid is sparse in the 4–6 region, but BN-normalized CNN activations populate that range densely (the trade-off is reversed for LLM activations).
+- **First-conv skip costs ~0.1 pp on INT4, ~1.5 pp on FP4** — keeping `conv1` in FP/INT8 is the common HW practice and what `--mx_skip_first` (default) does.
+
+### 7.2 Hand-rolled W4A4 PTQ stack
+
+```bash
+cd cifar
+
+# Per-tensor dynamic W4A4 (basic deployable)
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --quantize --w_bits 4 --a_bits 4 --act_percentile 0.999 --mse_weight --skip_first_conv
+
+# Best non-deployable accuracy ceiling: per-channel activation + BRECQ + QDrop
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --quantize --w_bits 4 --a_bits 4 \
+  --act_percentile 0.999 --mse_weight --skip_first_conv \
+  --brecq --adaround_samples 512 --brecq_iters 10000 \
+  --act_granularity per_channel --qdrop_p 0.5
+
+# NIPQ — learnable per-tensor scale + mixed-precision A4/A8 (fully deployable)
+python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
+  --quantize --w_bits 4 --a_bits 4 --mse_weight --skip_first_conv \
+  --nipq --nipq_target_bit 4.5 --nipq_iters 2000
+```
+
+### 7.3 CLI flags reference
+
+| Flag | Meaning |
+|---|---|
+| `--mx_quantize` | Enable MX (Microscaling) fake-quant for all Conv2d |
+| `--mx_format {fp4,int4}` | Element format. `fp4` = E2M1, `int4` = signed INT4 |
+| `--mx_group_size 16` or `32` | Block size along contraction dim. OCP spec = 32 |
+| `--mx_no_e8m0` | Use float per-group scale instead of E8M0 (debug only) |
+| `--mx_no_act` | Quantize weight only (skip activation MX quant) |
+| `--mx_no_skip_first` | Quantize the first Conv2d too (strict HW-faithful) |
+| `--quantize` | Enable hand-rolled W4A4 PTQ |
+| `--adaround` / `--brecq` | Calibration: per-layer AdaRound or block-wise BRECQ |
+| `--qdrop_p 0.5` | QDrop probability during calibration |
+| `--act_granularity {per_tensor,per_channel,per_sample}` | Activation grouping |
+| `--act_percentile 0.999` | Percentile clip for dynamic activation scale |
+| `--mse_weight` | MSE-optimal weight scale (BRECQ pre-step) |
+| `--skip_first_conv` | Keep the first conv in FP |
+| `--nipq` | NIPQ learnable scale + mixed-precision bit allocation |
+| `--nipq_target_bit 4.5` | MAC-weighted target avg activation bit (NIPQ) |
+| `--smoothquant --sq_alpha 0.5` | SmoothQuant BN→conv migration |
+
+### 7.4 torch.fx integration
+
+```python
+from quantization import apply_mx_quantization, fx_trace
+
+model = apply_mx_quantization(model, fp4=False, group_size=16)   # MX-INT4 g=16
+gm    = fx_trace(model.block1.layer.0)                           # any MXQuantConv2d
+for n in gm.graph.nodes:
+    print(n.op, n.target, '→', n.name)
+# call_module      weight_fake_quant      → weight_fake_quant
+# call_module      act_fake_quant         → act_fake_quant
+# call_function    matmul                 → matmul
+# ...
+```
+
+The `call_module` nodes are exactly what `torch.ao.quantization.prepare_fx`
+yields with QuantStub / DeQuantStub — swap them for HW kernels to deploy
+on MX-FP4 / MX-INT4 silicon (Blackwell, MX-capable NPUs).
+
+See [`quantization/README.md`](quantization/README.md) for full API reference.
+
+---
+
+## 8. Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
@@ -371,7 +493,7 @@ python main.py --adaptation stamp --dataset cifar10 --ood_dataset tiny_imagenet
 
 ---
 
-## Citation
+## 9. Citation
 
 ```bibtex
 @inproceedings{lee2025pafkip,
