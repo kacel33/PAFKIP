@@ -406,46 +406,44 @@ python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
 
 CIFAR-10, PAF-KIP, gaussian OOD. BF16 baseline: 78.37 % mean ACC, 99.74 % AUROC. `rng_seed=1`, batch 200, severity 5, 15 corruptions.
 
-**Per-tensor (global) — scale 1개 / tensor**
+**Per-tensor (global)** — scale 1개 / tensor
 
-| Config | Mean ACC | Δ vs BF16 | AUROC | 배포 |
-|---|---|---|---|---|
-| plain (max-abs dyn) | 62.23 | −16.14 | 99.67 | ✅ |
-| + percentile + MSE + skip-first | 71.81 | −6.56 | 99.71 | ✅ |
-| + AdaRound | 73.23 | −5.14 | 99.66 | ✅ |
-| + BRECQ | 73.03 | −5.34 | 99.57 | ✅ |
-| + NIPQ (mixed A4/A8) | 73.26 | −5.11 | — | ✅ |
-
-**Per-channel — scale C개 / tensor (C = input channels)**
-
-| Config | Mean ACC | Δ vs BF16 | AUROC | 배포 |
-|---|---|---|---|---|
-| plain | 69.52 | −8.85 | 99.69 | ❌ |
-| + percentile + MSE + skip-first | 72.06 | −6.31 | 99.64 | ❌ |
-| + AdaRound | 73.08 | −5.29 | 99.68 | ❌ |
-| + BRECQ + QDrop | 73.72 | −4.65 | 99.64 | ❌ |
-
-배포 불가: per-input-channel scale은 conv contraction 축에 인덱스 → 정수 GEMM 누산 밖으로 fold 불가.
-
-**Per-group (micro-scaling) — scale C/G개 / tensor**
-
-| Config | Group | Scale | Mean ACC | Δ vs BF16 | AUROC | 배포 |
-|---|---|---|---|---|---|---|
-| INT4 g=32 float scale | 32 | float | 77.52 | −0.85 | 99.77 | △ |
-| MX-INT4 g=32 | 32 | E8M0 | 77.50 | −0.87 | 99.75 | ✅ |
-| MX-INT4 g=16 | 16 | E8M0 | **77.73** | **−0.64** | 99.75 | ✅ |
-| MX-FP4 g=32 | 32 | E8M0 | 76.80 | −1.57 | 99.76 | ✅ |
-| MX-FP4 g=16 | 16 | E8M0 | 76.77 | −1.60 | 99.73 | ✅ |
-| MX-INT4 g=32, no-skip-first | 32 | E8M0 | 76.72 | −1.65 | 99.75 | ✅ |
-| MX-FP4 g=32, no-skip-first | 32 | E8M0 | 75.33 | −3.04 | 99.69 | ✅ |
-
-**최선 (granularity별)**
-
-| Granularity | Best Mean ACC | Δ vs BF16 | 배포 |
+| Config | Mean ACC | Δ vs BF16 | AUROC |
 |---|---|---|---|
-| Per-tensor (global) | 73.26 | −5.11 | ✅ |
-| Per-channel | 73.72 | −4.65 | ❌ |
-| **Per-group (g=16, MX-INT4)** | **77.73** | **−0.64** | ✅ |
+| plain (max-abs dyn) | 62.23 | −16.14 | 99.67 |
+| + percentile + MSE + skip-first | 71.81 | −6.56 | 99.71 |
+| + AdaRound | 73.23 | −5.14 | 99.66 |
+| + BRECQ | 73.03 | −5.34 | 99.57 |
+| + NIPQ (mixed A4/A8) | 73.26 | −5.11 | — |
+
+**Per-channel** — scale C개 / tensor (C = input channels)
+
+| Config | Mean ACC | Δ vs BF16 | AUROC |
+|---|---|---|---|
+| plain | 69.52 | −8.85 | 99.69 |
+| + percentile + MSE + skip-first | 72.06 | −6.31 | 99.64 |
+| + AdaRound | 73.08 | −5.29 | 99.68 |
+| + BRECQ + QDrop | 73.72 | −4.65 | 99.64 |
+
+**Per-group (micro-scaling)** — scale C/G개 / tensor
+
+| Config | Group | Scale | Mean ACC | Δ vs BF16 | AUROC |
+|---|---|---|---|---|---|
+| INT4 g=32 float scale | 32 | float | 77.52 | −0.85 | 99.77 |
+| MX-INT4 g=32 | 32 | E8M0 | 77.50 | −0.87 | 99.75 |
+| MX-INT4 g=16 | 16 | E8M0 | **77.73** | **−0.64** | 99.75 |
+| MX-FP4 g=32 | 32 | E8M0 | 76.80 | −1.57 | 99.76 |
+| MX-FP4 g=16 | 16 | E8M0 | 76.77 | −1.60 | 99.73 |
+| MX-INT4 g=32, no-skip-first | 32 | E8M0 | 76.72 | −1.65 | 99.75 |
+| MX-FP4 g=32, no-skip-first | 32 | E8M0 | 75.33 | −3.04 | 99.69 |
+
+**Best per granularity**
+
+| Granularity | Best Mean ACC | Δ vs BF16 |
+|---|---|---|
+| Per-tensor (global) | 73.26 | −5.11 |
+| Per-channel | 73.72 | −4.65 |
+| Per-group (g=16, MX-INT4) | **77.73** | **−0.64** |
 
 ### Flags
 
