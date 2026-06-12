@@ -51,12 +51,22 @@ def _round_int4(x: torch.Tensor) -> torch.Tensor:
     return x.round().clamp(INT4_QMIN, INT4_QMAX)
 
 
+def _round_int(x: torch.Tensor, qmax: int) -> torch.Tensor:
+    return x.round().clamp(-(qmax + 1), qmax)
+
+
 def _e8m0_scale(max_abs: torch.Tensor, level_max: float) -> torch.Tensor:
-    """Smallest power-of-2 such that max_abs / scale <= level_max."""
+    """Smallest power-of-2 such that max_abs / scale <= level_max.
+
+    Exponent floor is -100 (not E8M0's full -127): all-zero groups would
+    otherwise produce scale = 2^-126, which expf-based pow lowerings
+    (e.g. IREE llvm-cpu) flush to 0 and turn 0/0 into NaN. Groups this small
+    quantize to 0 either way, so the floor is semantics-preserving.
+    """
     in_dtype = max_abs.dtype
     m = max_abs.detach().float()
-    ratio = (m / level_max).clamp(min=2.0 ** -126)
-    exp = torch.ceil(torch.log2(ratio)).clamp(-127, 127)
+    ratio = (m / level_max).clamp(min=2.0 ** -100)
+    exp = torch.ceil(torch.log2(ratio)).clamp(-100, 127)
     return torch.pow(2.0, exp).to(in_dtype)
 
 
@@ -73,17 +83,20 @@ class MXFakeQuantize(nn.Module):
     quantize→dequantize stub pair produces in the FX graph.
     """
 
-    def __init__(self, fp4: bool = True, use_e8m0: bool = True):
+    def __init__(self, fp4: bool = True, use_e8m0: bool = True, bits: int = 4):
         super().__init__()
         self.fp4 = bool(fp4)
         self.use_e8m0 = bool(use_e8m0)
+        self.bits = int(bits)
+        assert not (self.fp4 and self.bits != 4), "FP4 (E2M1) is 4-bit only"
+        self.qmax = (2 ** (self.bits - 1)) - 1  # symmetric int target (e.g. 7, 127)
         # round-to-nearest lookup tables (registered so they move with .to())
         self.register_buffer('_levels', torch.tensor(list(E2M1_LEVELS)))
         self.register_buffer('_midpoints', torch.tensor(list(E2M1_MIDPOINTS)))
 
     @property
     def level_max(self) -> float:
-        return FP4_MAX if self.fp4 else INT4_MAX_VAL
+        return FP4_MAX if self.fp4 else float(self.qmax)
 
     def forward(self, x_grp: torch.Tensor) -> torch.Tensor:
         max_abs = x_grp.detach().abs().amax(dim=-1, keepdim=True)
@@ -97,12 +110,12 @@ class MXFakeQuantize(nn.Module):
             mids = self._midpoints.to(device=x_div.device, dtype=x_div.dtype)
             q = _round_e2m1(x_div, lvls, mids)
         else:
-            q = _round_int4(x_div)
+            q = _round_int(x_div, self.qmax)
         q = _ste(q, x_div)
         return q * scale  # fake-dequantized
 
     def extra_repr(self):
-        fmt = 'fp4-E2M1' if self.fp4 else 'int4'
+        fmt = 'fp4-E2M1' if self.fp4 else f'int{self.bits}'
         sc = 'E8M0' if self.use_e8m0 else 'float'
         return f'{fmt}, scale={sc}'
 
@@ -137,14 +150,14 @@ class MXActFakeQuantUnfold(nn.Module):
     and returns the unfolded fake-dequantized tensor of shape (B, Cin*kh*kw, L)."""
 
     def __init__(self, kernel_size, padding, stride, dilation, group_size: int = 32,
-                 fp4: bool = True, use_e8m0: bool = True):
+                 fp4: bool = True, use_e8m0: bool = True, bits: int = 4):
         super().__init__()
         self.kernel_size = kernel_size
         self.padding = padding
         self.stride = stride
         self.dilation = dilation
         self.G = int(group_size)
-        self.quant = MXFakeQuantize(fp4=fp4, use_e8m0=use_e8m0)
+        self.quant = MXFakeQuantize(fp4=fp4, use_e8m0=use_e8m0, bits=bits)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         kh, kw = self.kernel_size
@@ -180,7 +193,7 @@ class MXQuantConv2d(nn.Module):
     """
 
     def __init__(self, conv: nn.Conv2d, fp4: bool = True, group_size: int = 32,
-                 use_e8m0: bool = True, quant_act: bool = True):
+                 use_e8m0: bool = True, quant_act: bool = True, a_bits: int = 4):
         super().__init__()
         self.in_channels = conv.in_channels
         self.out_channels = conv.out_channels
@@ -201,10 +214,13 @@ class MXQuantConv2d(nn.Module):
         self.weight_fake_quant = MXWeightFakeQuant(group_size=group_size,
                                                    fp4=fp4, use_e8m0=use_e8m0)
         if quant_act:
+            # Activation element format: E2M1 only at 4 bits; INT at a_bits (e.g. MXINT8).
+            act_fp4 = fp4 and a_bits == 4
             self.act_fake_quant = MXActFakeQuantUnfold(
                 kernel_size=conv.kernel_size, padding=conv.padding,
                 stride=conv.stride, dilation=conv.dilation,
-                group_size=group_size, fp4=fp4, use_e8m0=use_e8m0)
+                group_size=group_size, fp4=act_fp4, use_e8m0=use_e8m0,
+                bits=a_bits)
         else:
             self.act_fake_quant = None
 
@@ -232,7 +248,7 @@ class MXQuantConv2d(nn.Module):
 # ---------------------------------------------------------------------------
 def _replace_conv2d_mx(model: nn.Module, fp4: bool, group_size: int,
                        use_e8m0: bool, quant_act: bool, skip_first: bool,
-                       _state) -> int:
+                       a_bits: int, _state) -> int:
     n = 0
     for name, mod in model.named_children():
         if isinstance(mod, nn.Conv2d):
@@ -242,26 +258,29 @@ def _replace_conv2d_mx(model: nn.Module, fp4: bool, group_size: int,
                 continue
             _state['first_seen'] = True
             q = MXQuantConv2d(mod, fp4=fp4, group_size=group_size,
-                              use_e8m0=use_e8m0, quant_act=quant_act)
+                              use_e8m0=use_e8m0, quant_act=quant_act,
+                              a_bits=a_bits)
             q = q.to(mod.weight.device)
             setattr(model, name, q)
             n += 1
         else:
             n += _replace_conv2d_mx(mod, fp4, group_size, use_e8m0, quant_act,
-                                    skip_first, _state)
+                                    skip_first, a_bits, _state)
     return n
 
 
 def apply_mx_quantization(model: nn.Module, fp4: bool = True,
                           group_size: int = 32, use_e8m0: bool = True,
-                          quant_act: bool = True, skip_first: bool = True) -> nn.Module:
-    """Replace Conv2d layers with MXQuantConv2d (per-layer MX-FP4 or MX-INT4)."""
+                          quant_act: bool = True, skip_first: bool = True,
+                          a_bits: int = 4) -> nn.Module:
+    """Replace Conv2d layers with MXQuantConv2d (per-layer MX-FP4 or MX-INT4).
+    a_bits sets the activation element width (4 = match weights, 8 = MXINT8)."""
     state = {'first_seen': False, 'skipped': []}
     n = _replace_conv2d_mx(model, fp4, group_size, use_e8m0, quant_act,
-                           skip_first, state)
+                           skip_first, a_bits, state)
     fmt = 'MX-FP4(E2M1)' if fp4 else 'MX-INT4'
     e8 = 'E8M0' if use_e8m0 else 'float-scale'
-    qa = 'W+A' if quant_act else 'W-only'
+    qa = f'W+A{a_bits}' if quant_act else 'W-only'
     skip = f", skip_first={state['skipped']}" if skip_first else ''
     print(f'[mx] Replaced {n} Conv2d with {fmt}'
           f' [group={group_size}, scale={e8}, {qa}{skip}]')

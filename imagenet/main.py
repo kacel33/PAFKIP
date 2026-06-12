@@ -97,6 +97,8 @@ parser.add_argument("--mx_group_size", default=32, type=int)
 parser.add_argument("--mx_no_e8m0", action="store_true")
 parser.add_argument("--mx_no_act", action="store_true")
 parser.add_argument("--mx_no_skip_first", action="store_true")
+parser.add_argument("--mx_a_bits", default=4, type=int,
+                    help="MX activation element bits (4 or 8=MXINT8). Weights stay 4-bit.")
 
 # Global (per-tensor act + per-channel weight) PTQ
 parser.add_argument("--quantize", action="store_true",
@@ -157,6 +159,7 @@ def evaluate(hyperparameters=None):
             use_e8m0=(not args.mx_no_e8m0),
             quant_act=(not args.mx_no_act),
             skip_first=(not args.mx_no_skip_first),
+            a_bits=args.mx_a_bits,
         )
 
     if args.quantize:
@@ -248,7 +251,10 @@ def evaluate(hyperparameters=None):
                 logger.info("not resetting model")
                 x_ind, y_ind = load_imagenetc(args.num_ex, severity, args.data_dir, True, [corruption_type])
                 x_ind, y_ind = x_ind.to(device), y_ind.to(device)
-                x_ood = _load_ood(args.num_ex, severity, args.data_dir, corruption_type, device)
+                if args.open_set_tta == "True":
+                    x_ood = _load_ood(args.num_ex, severity, args.data_dir, corruption_type, device)
+                else:
+                    x_ood = None
 
                 acc, (auc, fpr), oscr_ = get_results(model, x_ind, y_ind, x_ood, args.batch_size, device)
                 err = 1. - acc
@@ -286,6 +292,17 @@ def get_results(model: nn.Module,
     n_batches = math.ceil(x_ind.shape[0] / batch_size)
     in_domain_dataset = TensorDataset(x_ind, y_ind)
     in_domain_dataloader = DataLoader(in_domain_dataset, batch_size=batch_size, shuffle=False)
+
+    if x_ood is None:
+        # Closed-set: ID batches only, no OOD metrics.
+        with torch.no_grad():
+            for x_ind_curr, y_ind_curr in tqdm(in_domain_dataloader):
+                output = model(x_ind_curr)
+                if isinstance(output, tuple): (output, energy) = output
+                _, pred_ = output.max(1)
+                acc = acc + (pred_ == y_ind_curr).float().sum()
+        return acc.item() / x_ind.shape[0], (0.0, 0.0), 0.0
+
     out_domain_dataloader = DataLoader(x_ood, batch_size=batch_size, shuffle=False)
 
     dataloader_iterator = iter(in_domain_dataloader)

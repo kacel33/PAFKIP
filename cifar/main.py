@@ -128,6 +128,8 @@ def load_args():
                         help="Keep the first Conv2d in FP (sim convenience; off for strict HW-faithful).")
     parser.add_argument("--mx_no_skip_first", action="store_true",
                         help="Quantize the first Conv2d too (strict HW-faithful, no exceptions).")
+    parser.add_argument("--mx_a_bits", default=4, type=int,
+                        help="MX activation element bits (4 or 8=MXINT8). Weights stay 4-bit.")
 
     args = parser.parse_args()
 
@@ -157,6 +159,7 @@ def evaluate(args):
             use_e8m0=(not args.mx_no_e8m0),
             quant_act=(not args.mx_no_act),
             skip_first=(args.mx_skip_first and not args.mx_no_skip_first),
+            a_bits=args.mx_a_bits,
         )
 
     if args.quantize:

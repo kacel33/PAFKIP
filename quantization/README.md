@@ -67,16 +67,22 @@ CLI flags (`cifar/main.py`):
 | `--mx_quantize --mx_format {fp4,int4} --mx_group_size {16,32}` | MX block |
 | `--mx_no_e8m0` | float per-group scale |
 | `--mx_no_skip_first` | quantize first Conv2d too |
+| `--mx_a_bits {4,8}` | MX activation element bits (8 = MXINT8) |
 
 ## Results
 
-CIFAR-10-C, PAF-KIP, gaussian OOD, BF16 baseline 78.37 %.
+Mean ACC, 15 corruptions, severity 5. CIFAR: PAF-KIP open-set, gaussian OOD. ImageNet-C: ResNet-50, closed-set.
 
-| config | mean ACC | Δ vs BF16 | AUROC |
+| config | CIFAR-10 | CIFAR-100 | ImageNet-C |
 | --- | --- | --- | --- |
-| MX-INT4 g=16 | 77.73 | −0.64 | 99.75 |
-| MX-INT4 g=32 | 77.50 | −0.87 | 99.75 |
-| MX-FP4 g=16 | 76.77 | −1.60 | 99.73 |
-| MX-FP4 g=32 | 76.80 | −1.57 | 99.76 |
-| MX-INT4 g=32 strict | 76.72 | −1.65 | 99.75 |
-| MX-FP4 g=32 strict | 75.33 | −3.04 | 99.69 |
+| BF16 | 78.37 | 48.68 | 47.28 |
+| global W4A4 | 71.81 | 42.96 | 27.61 |
+| global W4A8 | 76.10 | 46.88 | 40.57 |
+| MX W4A4 (g16) | 77.73 | 45.62 | 36.08 |
+| MX W4A8 (g16) | 78.76 | 47.81 | 45.76 |
+
+MX W4A8 = MXINT4 weights + MXINT8 activations, both OCP MX element types.
+
+## IREE
+
+`torch.export` of MX layers lowers to standard ATen ops and compiles/runs through IREE (`iree-turbine`, llvm-cpu): single layers bit-exact, full MX-quantized WRN-40-2 matches PyTorch logits to 1.4e-6. `fx_trace`'s leaf Q/DQ form is the pattern-matching interface for swapping in real MX kernels (MLIR has `Float4E2M1FN`/`Float8E8M0FNU` upstream). E8M0 exponent floor is −100: `pow(2,−126)` underflows to 0 in expf-based lowerings and produces NaN via 0/0; sub-floor groups quantize to 0 either way.

@@ -404,7 +404,26 @@ python main.py --adaptation ours --dataset cifar10 --ood_dataset gaussian \
 
 ### Results
 
-CIFAR-10, PAF-KIP, gaussian OOD. BF16 baseline: 78.37 % mean ACC, 99.74 % AUROC. `rng_seed=1`, batch 200, severity 5, 15 corruptions.
+**Main comparison** — mean ACC over 15 corruptions, severity 5, `rng_seed=1`. Δ vs BF16 in parentheses.
+global = per-channel weight + per-tensor dynamic activation (percentile 0.999), skip first conv.
+MX = MXINT4 weight (group 16, E8M0) + MXINT4/MXINT8 activation (group 16), skip first conv.
+CIFAR: PAF-KIP open-set, gaussian OOD, batch 200. ImageNet-C: ResNet-50, PAF-KIP closed-set, 5000 ex, batch 64.
+
+| Config | CIFAR-10 | CIFAR-100 | ImageNet-C |
+|---|---|---|---|
+| BF16 | 78.37 | 48.68 | 47.28 |
+| global W4A4 | 71.81 (−6.56) | 42.96 (−5.72) | 27.61 (−19.67) |
+| global W4A8 | 76.10 (−2.27) | 46.88 (−1.80) | 40.57 (−6.71) |
+| MX W4A4 | 77.73 (−0.64) | 45.62 (−3.06) | 36.08 (−11.20) |
+| **MX W4A8** | **78.76 (+0.39)** | **47.81 (−0.87)** | **45.76 (−1.52)** |
+
+- MX W4A8 (MXINT4 weights + MXINT8 activations, both OCP MX element types) stays within 2 % of BF16 on all three datasets.
+- Decomposition (ImageNet): weight-only MX-INT4 costs −1.53; MXINT8 activation adds ~0 (45.76 vs ceiling 45.75). The W4A4 losses are activation-side.
+- Multi-seed (CIFAR-10, seeds 1–3): BF16 78.09 ± 0.25, MX-INT4 g16 77.57 ± 0.14, g32 77.63 ± 0.16, MX-FP4 g32 76.73 ± 0.10, global W4A4 71.80 ± 0.11 — orderings stable; g16 vs g32 indistinguishable.
+
+---
+
+CIFAR-10 granularity study (gaussian OOD, BF16 78.37, `rng_seed=1`):
 
 **Per-tensor (global)** — scale 1개 / tensor
 
@@ -455,6 +474,7 @@ CIFAR-10, PAF-KIP, gaussian OOD. BF16 baseline: 78.37 % mean ACC, 99.74 % AUROC.
 | `--mx_no_e8m0` | Float per-group scale instead of E8M0 |
 | `--mx_no_act` | Weight-only MX (skip activation) |
 | `--mx_no_skip_first` | Quantize the first Conv2d too |
+| `--mx_a_bits {4,8}` | MX activation element bits (8 = MXINT8); weights stay 4-bit |
 | `--quantize --w_bits 4 --a_bits 4` | Hand-rolled W4A4 PTQ |
 | `--adaround` / `--brecq` | Per-layer AdaRound / block-wise BRECQ |
 | `--qdrop_p 0.5` | QDrop probability during calibration |
@@ -479,6 +499,14 @@ for n in gm.graph.nodes:
 # call_function  matmul
 # ...
 ```
+
+### IREE
+
+Two graph forms:
+- `torch.export` (fake-quant inlined as ATen ops) — compiles and runs through IREE (`iree-turbine`, llvm-cpu). Verified: single MX layers bit-exact; full MX-quantized WRN-40-2 matches PyTorch logits to 1.4e-6. INT path uses only `round/clamp/amax/log2/pow/im2col/matmul`; FP4 additionally uses `bucketize/index` (also supported).
+- `fx_trace` (Q/DQ as leaf `call_module` nodes) — not directly ingestible; intended as the pattern-matching interface for a compiler pass that swaps Q/DQ pairs for real MX kernels (MLIR has `Float4E2M1FN` / `Float8E8M0FNU` element types upstream).
+
+Note: the E8M0 exponent floor is −100 (not −127) — all-zero groups would otherwise produce `pow(2,−126)`, which expf-based lowerings flush to 0, turning 0/0 into NaN. Groups below the floor quantize to 0 either way.
 
 API reference: [`quantization/README.md`](quantization/README.md).
 
